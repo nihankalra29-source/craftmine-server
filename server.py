@@ -20,6 +20,8 @@ Multiplayer directory (groundwork for host/join - the game servers themselves ru
   GET    /api/servers                      -> {servers: [{name, address, port, players, maxPlayers, version}]}
   POST   /api/servers (Bearer) {name, address, port, players, maxPlayers, version}   register / heartbeat (every <60s)
   DELETE /api/servers (Bearer)             remove your listing
+
+Admin:  GET /admin (page; enter the Administrator password)   GET /api/admin/users (Bearer admin)
 """
 import hashlib, hmac, json, os, re, secrets, sqlite3, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -149,6 +151,21 @@ def new_session(name):
     return token
 
 
+ADMIN_PAGE = b"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Zoolda Admin</title><style>body{font:16px system-ui;background:#0b1230;color:#e9eefc;max-width:760px;margin:30px auto;padding:0 16px}
+input,button{font:inherit;padding:8px;margin:4px 0}table{width:100%;border-collapse:collapse;margin-top:14px}
+td,th{padding:6px 8px;border-bottom:1px solid #26356b;text-align:left}th{color:#ffd24d}.on{color:#7dff8a}</style>
+<h2>Zoolda Admin</h2><div id=f><input id=p type=password placeholder="Administrator password"> <button onclick=go()>View</button></div><div id=o></div>
+<script>
+async function go(){const o=document.getElementById('o');o.textContent='Loading (the server may be waking up)...';
+try{const l=await fetch('/api/login',{method:'POST',body:JSON.stringify({username:'Administrator',password:document.getElementById('p').value})}).then(r=>r.json());
+if(!l.token){o.textContent=l.error||'Login failed';return}
+const d=await fetch('/api/admin/users',{headers:{Authorization:'Bearer '+l.token}}).then(r=>r.json());
+const ago=t=>{if(!t)return'never';const m=(Date.now()/1000-t)/60;return m<5?'<span class=on>online now</span>':m<60?Math.round(m)+' min ago':m<1440?Math.round(m/60)+' h ago':Math.round(m/1440)+' days ago'};
+o.innerHTML='<p>'+d.users.length+' accounts</p><table><tr><th>Name<th>Role<th>Created<th>Last active</tr>'+d.users.map(u=>'<tr><td>'+u.name+'<td>'+u.role+'<td>'+new Date(u.created*1000).toLocaleDateString()+'<td>'+ago(u.last_active)).join('')+'</table>'}catch(e){o.textContent='Error: '+e}}
+</script>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "CraftMine/1.0"
 
@@ -204,7 +221,23 @@ class Handler(BaseHTTPRequestHandler):
                 del _servers[k]
             listing = [{k: v[k] for k in ("name", "address", "port", "players", "maxPlayers", "version")} for v in _servers.values()]
             return self._send(200, {"servers": listing})
+        if self.path == "/admin":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(ADMIN_PAGE)))
+            self.end_headers()
+            return self.wfile.write(ADMIN_PAGE)
         u = self._user()
+        if self.path == "/api/admin/users":
+            if not u or u[1] != "admin":
+                return self._send(403, {"error": "Administrators only."})
+            sess = {r[0]: r[1] for r in dbx("SELECT user_key, MAX(expires) FROM sessions GROUP BY user_key")}
+            saved = {r[0]: r[1] for r in dbx("SELECT user_key, updated FROM saves")}
+            out = []
+            for key, name, role, created in dbx("SELECT key, name, role, created FROM users ORDER BY created"):
+                t = max(sess.get(key, 0) - TOKEN_TTL, saved.get(key, 0))
+                out.append({"name": name, "role": role, "created": created, "last_active": t or None})
+            return self._send(200, {"users": out})
         if self.path == "/api/me":
             return self._send(200, {"username": u[0], "role": u[1], "dlc": dlc_for(u[0].lower(), u[1])}) if u else self._send(401, {"error": "Not signed in."})
         if self.path == "/api/save":
