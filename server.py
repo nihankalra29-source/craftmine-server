@@ -43,6 +43,9 @@ SCHEMA = [
     "CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_key TEXT NOT NULL, expires DOUBLE PRECISION NOT NULL)",
     "CREATE TABLE IF NOT EXISTS saves (user_key TEXT PRIMARY KEY, data TEXT NOT NULL, updated DOUBLE PRECISION NOT NULL)",
     "CREATE TABLE IF NOT EXISTS entitlements (user_key TEXT NOT NULL, sku TEXT NOT NULL, granted DOUBLE PRECISION NOT NULL, PRIMARY KEY (user_key, sku))",
+    "CREATE TABLE IF NOT EXISTS staff (key TEXT PRIMARY KEY, name TEXT NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL, role TEXT NOT NULL, status TEXT NOT NULL, message TEXT NOT NULL, created DOUBLE PRECISION NOT NULL, decided DOUBLE PRECISION)",
+    "CREATE TABLE IF NOT EXISTS staff_sessions (token TEXT PRIMARY KEY, staff_key TEXT NOT NULL, expires DOUBLE PRECISION NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS staff_posts (id TEXT PRIMARY KEY, kind TEXT NOT NULL, author TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, created DOUBLE PRECISION NOT NULL)",
 ]
 
 if USE_PG:
@@ -151,6 +154,16 @@ def new_session(name):
     return token
 
 
+STAFF_ROLES = ("manager", "administrator", "helper")
+
+
+def staff_session(key):
+    token = secrets.token_hex(32)
+    dbx("INSERT INTO staff_sessions (token, staff_key, expires) VALUES (?,?,?)", (token, key, time.time() + TOKEN_TTL))
+    dbx("DELETE FROM staff_sessions WHERE expires < ?", (time.time(),))
+    return token
+
+
 ADMIN_PAGE = b"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Zoolda Admin</title><style>body{font:16px system-ui;background:#0b1230;color:#e9eefc;max-width:760px;margin:30px auto;padding:0 16px}
 input,button{font:inherit;padding:8px;margin:4px 0}table{width:100%;border-collapse:collapse;margin-top:14px}
@@ -200,10 +213,34 @@ class Handler(BaseHTTPRequestHandler):
                    (auth[7:], time.time()))
         return tuple(rows[0]) if rows else None
 
+    def _staff(self):
+        """(name, role) for a signed-in staff member; role is owner / manager / administrator / helper."""
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return None
+        u = self._user()
+        if u and u[1] == "admin":
+            return (u[0], "owner")
+        rows = dbx("SELECT f.name, f.role FROM staff_sessions s JOIN staff f ON f.key=s.staff_key "
+                   "WHERE s.token=? AND s.expires>? AND f.status='active'", (auth[7:], time.time()))
+        return tuple(rows[0]) if rows else None
+
+    def _query(self):
+        from urllib.parse import urlparse, parse_qs
+        p = urlparse(self.path)
+        return p.path, {k: v[0] for k, v in parse_qs(p.query).items()}
+
     def do_OPTIONS(self):
         self._send(204, {})
 
     def do_DELETE(self):
+        path, q = self._query()
+        if path == "/api/staff/posts":
+            st = self._staff()
+            if not st or st[1] != "owner":
+                return self._send(403, {"error": "Only the owner can delete posts."})
+            dbx("DELETE FROM staff_posts WHERE id=?", (q.get("id", ""),))
+            return self._send(200, {"ok": True})
         u = self._user()
         if self.path != "/api/servers":
             return self._send(404, {"error": "Not found."})
@@ -221,6 +258,25 @@ class Handler(BaseHTTPRequestHandler):
                 del _servers[k]
             listing = [{k: v[k] for k in ("name", "address", "port", "players", "maxPlayers", "version")} for v in _servers.values()]
             return self._send(200, {"servers": listing})
+        path, q = self._query()
+        if path.startswith("/api/staff/"):
+            st = self._staff()
+            if not st:
+                return self._send(401, {"error": "Not signed in."})
+            if path == "/api/staff/me":
+                return self._send(200, {"name": st[0], "role": st[1]})
+            if path == "/api/staff/applications":
+                if st[1] != "owner":
+                    return self._send(403, {"error": "Owner only."})
+                rows = dbx("SELECT name, role, status, message, created FROM staff ORDER BY created DESC")
+                return self._send(200, {"staff": [dict(zip(("name", "role", "status", "message", "created"), r)) for r in rows]})
+            if path == "/api/staff/posts":
+                kind = q.get("kind", "idea")
+                if kind not in ("beta", "idea") or (kind == "beta" and st[1] not in ("owner", "manager")):
+                    return self._send(403, {"error": "You don't have access to that."})
+                rows = dbx("SELECT id, author, title, body, created FROM staff_posts WHERE kind=? ORDER BY created DESC", (kind,))
+                return self._send(200, {"posts": [dict(zip(("id", "author", "title", "body", "created"), r)) for r in rows]})
+            return self._send(404, {"error": "Not found."})
         if self.path == "/admin":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -229,7 +285,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.wfile.write(ADMIN_PAGE)
         u = self._user()
         if self.path == "/api/admin/users":
-            if not u or u[1] != "admin":
+            st = self._staff()
+            if not st or st[1] not in ("owner", "manager", "administrator"):
                 return self._send(403, {"error": "Administrators only."})
             sess = {r[0]: r[1] for r in dbx("SELECT user_key, MAX(expires) FROM sessions GROUP BY user_key")}
             saved = {r[0]: r[1] for r in dbx("SELECT user_key, updated FROM saves")}
@@ -261,6 +318,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True})
 
     def do_POST(self):
+        if self.path.startswith("/api/staff/"):
+            return self._staff_post()
         if self.path == "/api/dlc/redeem":
             u = self._user()
             if not u:
@@ -316,6 +375,79 @@ class Handler(BaseHTTPRequestHandler):
         if not row or not hmac.compare_digest(bytes.fromhex(row[2]), pw_hash(pw, bytes.fromhex(row[1]))):
             return self._send(401, {"error": "Wrong username or password."})
         self._send(200, {"token": new_session(row[0]), "username": row[0], "role": row[3], "dlc": dlc_for(row[0].lower(), row[3])})
+
+
+def _staff_post(self):
+    path = self.path
+    b = self._body() or {}
+    if path in ("/api/staff/apply", "/api/staff/login"):
+        if throttled(self.client_address[0]):
+            return self._send(429, {"error": "Too many attempts. Wait a minute."})
+        name, pw = str(b.get("username", "")).strip(), str(b.get("password", ""))
+        if path == "/api/staff/apply":
+            role, msg = str(b.get("role", "")).lower(), str(b.get("message", "")).strip()[:600]
+            if role not in STAFF_ROLES:
+                return self._send(400, {"error": "Pick a role."})
+            if not USER_RE.match(name) or name.lower() == ADMIN_NAME.lower():
+                return self._send(400, {"error": "Username: 3-16 letters, numbers or _."})
+            if len(pw) < 8:
+                return self._send(400, {"error": "Password must be at least 8 characters."})
+            if len(msg) < 10:
+                return self._send(400, {"error": "Tell us a little about why you'd be a good fit."})
+            if dbx("SELECT 1 FROM staff WHERE key=?", (name.lower(),)):
+                return self._send(409, {"error": "That username is already taken."})
+            salt = secrets.token_bytes(16)
+            dbx("INSERT INTO staff (key, name, salt, hash, role, status, message, created) VALUES (?,?,?,?,?,?,?,?)",
+                (name.lower(), name, salt.hex(), pw_hash(pw, salt).hex(), role, "pending", msg, time.time()))
+            return self._send(200, {"ok": True})
+        if name.lower() == ADMIN_NAME.lower():
+            rows = dbx("SELECT name, salt, hash, role FROM users WHERE key=?", (name.lower(),))
+            row = rows[0] if rows else None
+            if not row or row[3] != "admin" or not hmac.compare_digest(bytes.fromhex(row[2]), pw_hash(pw, bytes.fromhex(row[1]))):
+                return self._send(401, {"error": "Wrong username or password."})
+            return self._send(200, {"token": new_session(row[0]), "name": row[0], "role": "owner", "status": "active"})
+        rows = dbx("SELECT name, salt, hash, role, status FROM staff WHERE key=?", (name.lower(),))
+        row = rows[0] if rows else None
+        if not row or not hmac.compare_digest(bytes.fromhex(row[2]), pw_hash(pw, bytes.fromhex(row[1]))):
+            return self._send(401, {"error": "Wrong username or password."})
+        if row[4] == "pending":
+            return self._send(403, {"error": "Your application is still waiting for the owner to review it."})
+        if row[4] != "active":
+            return self._send(403, {"error": "Sorry, your application was declined."})
+        return self._send(200, {"token": staff_session(row[0].lower()), "name": row[0], "role": row[3], "status": "active"})
+    st = self._staff()
+    if not st:
+        return self._send(401, {"error": "Not signed in."})
+    if path == "/api/staff/decide":
+        if st[1] != "owner":
+            return self._send(403, {"error": "Owner only."})
+        key = str(b.get("name", "")).lower()
+        status = "active" if b.get("accept") else "declined"
+        if not dbx("SELECT 1 FROM staff WHERE key=?", (key,)):
+            return self._send(404, {"error": "No such applicant."})
+        dbx("UPDATE staff SET status=?, decided=? WHERE key=?", (status, time.time(), key))
+        return self._send(200, {"ok": True, "status": status})
+    if path == "/api/staff/remove":
+        if st[1] != "owner":
+            return self._send(403, {"error": "Owner only."})
+        key = str(b.get("name", "")).lower()
+        dbx("DELETE FROM staff WHERE key=?", (key,))
+        dbx("DELETE FROM staff_sessions WHERE staff_key=?", (key,))
+        return self._send(200, {"ok": True})
+    if path == "/api/staff/posts":
+        kind = str(b.get("kind", "idea"))
+        title, body = str(b.get("title", "")).strip()[:100], str(b.get("body", "")).strip()[:2000]
+        if kind == "beta" and st[1] != "owner":
+            return self._send(403, {"error": "Only the owner can post beta updates."})
+        if kind not in ("beta", "idea") or not title or not body:
+            return self._send(400, {"error": "A title and some text are needed."})
+        dbx("INSERT INTO staff_posts (id, kind, author, title, body, created) VALUES (?,?,?,?,?,?)",
+            (secrets.token_hex(8), kind, st[0], title, body, time.time()))
+        return self._send(200, {"ok": True})
+    self._send(404, {"error": "Not found."})
+
+
+Handler._staff_post = _staff_post
 
 
 if __name__ == "__main__":
